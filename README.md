@@ -1,188 +1,155 @@
-"""Guide 4 : traiter un lot de bout en bout (contrôles, signature, chargement, rapport).
+# CampusEquip v2 : axes 1 (SQL) et 2 (Python)
 
-Le surveillant (surveiller.py) appelle traiter_lot(dossier, manifeste) pour chaque nouveau lot.
-La fonction renvoie un dictionnaire avec un statut :
-    CHARGE            le lot est nouveau : les contrats acceptés sont écrits dans la base
-    DEJA_CHARGE       ce contenu a déjà été chargé : rien n'est ajouté
-    REJETE_STRUCTURE  les colonnes sont fausses : le lot est refusé, aucune écriture
-Une panne ou un conflit LÈVE une erreur (elle reste visible, ce n'est jamais un succès).
+Projet de binôme, à remettre le 21 novembre 2026.
+Ce dépôt charge des lots de locations de matériel (fichiers CSV + JSON) dans PostgreSQL, applique des règles de
+qualité, isole les contrats douteux en quarantaine, puis permet 3 analyses SQL et un graphique.
 
-La connexion à la base vient de la variable d'environnement CAMPUS_DSN (aucun secret dans le code).
-"""
-import hashlib
-import json
-import os
-from datetime import datetime, timezone
-from pathlib import Path
+## 1. Ce qu'il faut avoir installé
 
-import psycopg
+| Outil | Pourquoi |
+|---|---|
+| Python 3.10 ou plus | exécuter les programmes |
+| Docker Desktop | faire tourner PostgreSQL dans un conteneur (`db-1`, port 5433) |
+| DBeaver | créer la base, lancer le SQL, vérifier les résultats |
+| VS Code | ouvrir le dossier du projet et lancer les commandes |
 
-from etudiant import controle
+Bibliothèques Python à installer une fois, dans le terminal de VS Code :
 
-RULES_VERSION = 'campusequip-v2.0'
-DOSSIER_RAPPORTS = Path('rapports')       # rapports et quarantaines : un fichier par tentative
-VERROU = (28, 2026)                       # verrou PostgreSQL : un seul chargement à la fois
+```
+pip install "psycopg[binary]" matplotlib
+```
 
+## 2. Préparer une base neuve
 
-class ChargementError(RuntimeError):
-    """Un chargement n'a pas pu avoir lieu : la transaction est annulée et l'échec reste visible."""
+La base du projet doit être **distincte de ShopFlow** et ne contenir qu'**une seule campagne**.
 
+1. Dans Docker Desktop, démarrer le conteneur PostgreSQL (`db-1` doit être vert).
+2. Dans DBeaver, se connecter au serveur (`localhost`, port `5433`), puis créer une base nommée `campusequip`
+   (clic droit sur « Bases de données », puis « Créer une nouvelle base »).
+3. Ouvrir `etudiant/schema.sql` dans DBeaver **sur la base campusequip** (vérifier le nom dans la barre du haut) et
+   exécuter tout le script (Alt + X). Il crée 9 tables et la vue `line_amounts`.
 
-# ---------------------------------------------------------------- signature
-def sha256_fichier(chemin):
-    """Empreinte SHA-256 d'un fichier (lu par morceaux)."""
-    h = hashlib.sha256()
-    with open(chemin, 'rb') as f:
-        for morceau in iter(lambda: f.read(65536), b''):
-            h.update(morceau)
-    return h.hexdigest()
+Pour repartir d'une base vide de test (`campusequip_test`) en une commande, sans toucher à `campusequip` :
 
+```
+python preparer_base_test.py
+```
 
-def calculer_signature(empreinte_locations, empreinte_referentiels):
-    """Signature du lot = empreintes des 2 fichiers + version des règles.
-    Le nom du dossier n'y entre pas : un dossier renommé garde la même signature."""
-    texte = f'{empreinte_locations}:{empreinte_referentiels}:{RULES_VERSION}'
-    return hashlib.sha256(texte.encode('utf-8')).hexdigest()
+## 3. Se connecter sans secret dans les fichiers
 
+Aucun mot de passe n'est écrit dans le code ni dans ce dépôt. La connexion est lue dans la variable d'environnement
+`CAMPUS_DSN`. Dans le terminal PowerShell de VS Code (à refaire à chaque nouveau terminal) :
 
-# ---------------------------------------------------------------- rapports (un fichier par tentative)
-def ecrire_rapport(manifeste, rapport, rejetees):
-    """Écrit le rapport (JSON) et la quarantaine (une ligne JSON par ligne rejetée)."""
-    DOSSIER_RAPPORTS.mkdir(parents=True, exist_ok=True)
-    instant = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')    # rend chaque tentative unique
-    base = f"lot_{manifeste['batch_number']:06d}_{instant}"
-    chemin_rapport = DOSSIER_RAPPORTS / f'{base}_rapport.json'
-    chemin_rapport.write_text(json.dumps(rapport, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
-    if rejetees:
-        with (DOSSIER_RAPPORTS / f'{base}_quarantaine.jsonl').open('w', encoding='utf-8') as f:
-            for l in rejetees:
-                f.write(json.dumps({'source_row': l['source_row'], 'raw': l['raw'], 'reasons': l['reasons']},
-                                   ensure_ascii=False) + '\n')
-    return chemin_rapport
+```
+$env:CAMPUS_DSN = "postgresql://UTILISATEUR:MOT_DE_PASSE@localhost:5433/campusequip"
+```
 
+Remplacer `UTILISATEUR` et `MOT_DE_PASSE` par les identifiants de la base locale. Vérifier ensuite :
 
-# ---------------------------------------------------------------- écriture dans la base
-def inserer_referentiels(conn, donnees):
-    """Les référentiels sont fixes dans une campagne : on les écrit une fois (ON CONFLICT = sans effet ensuite)."""
-    cur = conn.cursor()
-    cur.executemany('INSERT INTO campus (campus_id, name) VALUES (%s, %s) ON CONFLICT DO NOTHING',
-                    [(c['campus_id'], c['name']) for c in donnees['campuses']])
-    cur.executemany('INSERT INTO sites (site_id, campus_id, name) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING',
-                    [(s['site_id'], s['campus_id'], s['name']) for s in donnees['sites']])
-    cur.executemany('INSERT INTO clients (client_id, name) VALUES (%s, %s) ON CONFLICT DO NOTHING',
-                    [(c['client_id'], c['name']) for c in donnees['clients']])
-    # une catégorie doit être écrite APRÈS son parent
-    restantes, ecrites = list(donnees['categories']), set()
-    while restantes:
-        pretes = [c for c in restantes if c['parent_id'] is None or c['parent_id'] in ecrites]
-        if not pretes:
-            raise ChargementError('catégories : parent introuvable dans le référentiel')
-        cur.executemany('INSERT INTO categories (category_id, name, parent_id) VALUES (%s, %s, %s) '
-                        'ON CONFLICT DO NOTHING', [(c['category_id'], c['name'], c['parent_id']) for c in pretes])
-        ecrites |= {c['category_id'] for c in pretes}
-        restantes = [c for c in restantes if c['category_id'] not in ecrites]
-    cur.executemany('INSERT INTO equipments (equipment_id, name, category_id) VALUES (%s, %s, %s) '
-                    'ON CONFLICT DO NOTHING',
-                    [(e['equipment_id'], e['name'], e['category_id']) for e in donnees['equipment']])
+```
+python test_connexion.py
+```
 
+Résultat attendu : `Connecté à la base : campusequip`, `Tables trouvées dans public : 9`, puis `Tout est bon.`
 
-def charger(conn, manifeste, signature, empreintes, ref, resultat, rapport):
-    """Tout se passe dans UNE transaction (celle de `with psycopg.connect(...)` dans traiter_lot)."""
-    conn.execute('SELECT pg_advisory_xact_lock(%s, %s)', VERROU)
+## 4. Démarrer le traitement
 
-    # 1) une seule campagne par base : la première est mémorisée, une autre est refusée
-    ligne = conn.execute("SELECT value FROM lab_config WHERE key = 'campaign_id'").fetchone()
-    if ligne is None:
-        conn.execute("INSERT INTO lab_config (key, value) VALUES ('campaign_id', %s)", (manifeste['campaign_id'],))
-    elif ligne[0] != manifeste['campaign_id']:
-        raise ChargementError(f"campagne {manifeste['campaign_id']} refusée : cette base est réservée à la "
-                              f"campagne {ligne[0]}")
+Charger les deux petits lots d'exemple (chargement dans la base `campusequip`) :
 
-    # 2) rejeu : cette signature est déjà dans le journal -> on n'ajoute rien
-    if conn.execute('SELECT 1 FROM ingestion_batches WHERE batch_signature = %s', (signature,)).fetchone():
-        return 'DEJA_CHARGE'
+```
+python surveiller.py --entree exemples --une-fois
+```
 
-    # 3) un contract_id déjà chargé ne doit jamais être écrasé : la transaction entière échoue
-    lignes = [l['values'] for l in resultat['accepted']]
-    ids = sorted({v['contract_id'] for v in lignes})
-    if ids:
-        deja = conn.execute('SELECT contract_id FROM contracts WHERE contract_id = ANY(%s)', (ids,)).fetchall()
-        if deja:
-            exemples = ', '.join(str(r[0]) for r in deja[:5])
-            raise ChargementError(f'{len(deja)} contrat(s) déjà chargé(s) avec un nouveau contenu '
-                                  f'(par exemple : {exemples}) : lot annulé, rien n\'est ajouté')
+- Premier passage : chaque lot affiche `CHARGE`.
+- Relancer la même commande : chaque lot affiche `DEJA_CHARGE` et rien n'est ajouté (le journal `ingestion_batches` empêche
+  le double chargement, même après un redémarrage).
+- Un rapport JSON et, s'il y a des rejets, un fichier de quarantaine sont écrits dans `rapports/` à chaque tentative.
 
-    # 4) écriture : référentiels, contrats, lignes, puis journal du lot (tout ou rien)
-    inserer_referentiels(conn, ref['donnees'])
-    cur = conn.cursor()
-    entetes = {}
-    for v in lignes:                                       # l'en-tête est identique sur toutes les lignes
-        entetes.setdefault(v['contract_id'], (v['contract_id'], v['client_id'], v['site_id'],
-                                              v['start_date'], v['status']))
-    cur.executemany('INSERT INTO contracts (contract_id, client_id, site_id, start_date, status) '
-                    'VALUES (%s, %s, %s, %s, %s)', list(entetes.values()))
-    cur.executemany('INSERT INTO contract_lines (contract_id, line_no, equipment_id, quantity, unit, duration, '
-                    'unit_rate) VALUES (%s, %s, %s, %s, %s, %s, %s)',
-                    [(v['contract_id'], v['line_no'], v['equipment_id'], v['quantity'], v['unit'],
-                      v['duration'], v['unit_rate']) for v in lignes])
-    rapport['lignes_ajoutees_en_base'] = len(lignes)
-    rapport['contrats_ajoutes_en_base'] = len(entetes)
-    rapport['statut'] = 'CHARGE'
-    conn.execute('INSERT INTO ingestion_batches (batch_signature, campaign_id, batch_number, rules_version, '
-                 'locations_sha256, referentiels_sha256, accepted_contracts, accepted_lines, report) '
-                 'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)',
-                 (signature, manifeste['campaign_id'], manifeste['batch_number'], RULES_VERSION,
-                  empreintes[0], empreintes[1], len(entetes), len(lignes), json.dumps(rapport)))
-    return 'CHARGE'
+Contrôler un lot **sans toucher à la base** :
 
+```
+python controle_lot.py exemples/lot_000001
+```
 
-# ---------------------------------------------------------------- la fonction appelée par le surveillant
-def traiter_lot(dossier, manifeste):
-    dossier = Path(dossier)
-    dsn = os.environ.get('CAMPUS_DSN')
-    if not dsn:
-        raise ChargementError('variable CAMPUS_DSN absente : voir le README (connexion à la base)')
+## 5. Les analyses et le graphique
 
-    # 1) structure du fichier : si elle est fausse, le lot est refusé AVANT toute écriture
-    try:
-        lignes = controle.lire_locations(dossier / 'locations.csv')
-    except controle.StructureError as e:
-        rapport = {'statut': 'REJETE_STRUCTURE', 'lot': dossier.name, 'motif': str(e),
-                   'lignes_ajoutees_en_base': 0}
-        chemin = ecrire_rapport(manifeste, rapport, [])
-        return {'status': 'REJETE_STRUCTURE', 'motif': str(e), 'lignes_ajoutees_en_base': 0,
-                'rapport': str(chemin)}
+- `analyses.sql` : 3 analyses + la preuve à la main du contrat 2 (402 + 756 + 4528 = 5686). À ouvrir dans DBeaver sur
+  `campusequip`.
+- Graphique du cumul par campus :
 
-    # 2) contrôles de qualité (voir controle.py) + signature du lot
-    ref = controle.lire_referentiels(dossier / 'referentiels.json')
-    resultat = controle.controler(lignes, ref)
-    empreintes = (sha256_fichier(dossier / 'locations.csv'), sha256_fichier(dossier / 'referentiels.json'))
-    signature = calculer_signature(*empreintes)
-    rapport = dict(resultat['report'], lot=dossier.name, batch_number=manifeste['batch_number'],
-                   campaign_id=manifeste['campaign_id'], signature=signature, rules_version=RULES_VERSION,
-                   lignes_ajoutees_en_base=0, contrats_ajoutes_en_base=0)
-    if rapport['alertes']:
-        print(f"ALERTE {dossier.name} : taux de rejet {rapport['taux_de_rejet_pct']} % (seuil 20 %)", flush=True)
+```
+python graphique.py
+```
 
-    # 3) chargement : une transaction. `with` valide (commit) au succès et annule (rollback) sur erreur.
-    try:
-        with psycopg.connect(dsn) as conn:
-            statut = charger(conn, manifeste, signature, empreintes, ref, resultat, rapport)
-    except Exception as e:
-        rapport.update(statut='ECHEC', erreur=f'{type(e).__name__}: {e}',
-                       lignes_ajoutees_en_base=0, contrats_ajoutes_en_base=0)
-        ecrire_rapport(manifeste, rapport, resultat['rejected'])
-        raise                                              # l'échec reste visible pour le surveillant
+Il écrit `graphique_cumul.png` dans le dossier.
 
-    if statut == 'DEJA_CHARGE':                            # rejeu : rien n'a été ajouté
-        rapport['lignes_ajoutees_en_base'] = 0
-        rapport['contrats_ajoutes_en_base'] = 0
-    rapport['statut'] = statut
-    chemin = ecrire_rapport(manifeste, rapport, resultat['rejected'])
-    return {'status': statut, 'lot': dossier.name,
-            'lignes_recues': rapport['lignes_recues'],
-            'lignes_ajoutees_en_base': rapport['lignes_ajoutees_en_base'],
-            'contrats_ajoutes_en_base': rapport['contrats_ajoutes_en_base'],
-            'lignes_rejetees': rapport['lignes_rejetees'],
-            'taux_de_rejet_pct': rapport['taux_de_rejet_pct'],
-            'alertes': rapport['alertes'], 'rapport': str(chemin)}
+## 6. Les tests de règles et de rejeu
+
+Les petits lots de test se fabriquent avec :
+
+```
+python generer_tests.py
+python observer_unitaires.py
+```
+
+- `essais_preuves/unitaires/` : 9 petits lots (U1 à U9) pour les règles de qualité (`controle_lot.py` ou
+  `observer_unitaires.py`).
+- `essais_preuves/flux_A`, `flux_B`, `flux_C` : essais avec la base (trois lots, rejeu, contrat déjà chargé, structure
+  fausse, alerte à 20 %). À lancer sur la base de test :
+
+```
+python preparer_base_test.py
+$env:CAMPUS_DSN = "postgresql://UTILISATEUR:MOT_DE_PASSE@localhost:5433/campusequip_test"
+python surveiller.py --entree essais_preuves/flux_A --une-fois
+```
+
+- `fiche_tests.md` : pour chaque essai, les commandes, l'état initial, l'**attendu** (écrit avant) et l'**observé**.
+
+## 7. Démonstration en continu (trois lots)
+
+Sur une base neuve (`campusequip_test`) et un nouveau dossier `flux`. Deux terminaux dans VS Code.
+
+Terminal 1 (le surveillant, qui attend les lots) :
+
+```
+python surveiller.py --entree flux
+```
+
+Terminal 2 (le générateur, un lot toutes les 10 secondes, trois lots au total) :
+
+```
+python generer.py --sortie flux --contrats 50 --lots 3 --profil mixte --intervalle 10
+```
+
+## 8. Arrêter proprement
+
+- Arrêter le surveillant : **Ctrl + C** dans son terminal.
+- Le générateur s'arrête seul avec `--lots 3` ; sinon **Ctrl + C**.
+- Ne pas supprimer `generator-state.json`. Pour repartir de zéro : nouveau dossier **et** base neuve.
+- Arrêter le conteneur PostgreSQL depuis Docker Desktop si besoin. Les données sont conservées.
+
+## 9. Règles de qualité appliquées (dans l'ordre)
+
+1. Structure du fichier fausse (colonnes) : tout le lot est refusé (`REJETE_STRUCTURE`) avant toute écriture.
+2. Espaces retirés, `status` et `unit` en minuscules.
+3. Ligne répétée à l'identique : gardée une seule fois.
+4. Chaque ligne est vérifiée : types, bornes, client, site et équipement connus.
+5. Chaque contrat est vérifié comme un tout : en-tête identique, clé (contrat, ligne) unique. Un problème isole
+   **tout le contrat** en quarantaine.
+6. Quantité supérieure à 20 : signalée comme anomalie, sans rejet.
+7. Taux de rejet supérieur à 20 % : alerte, mais les contrats valides sont chargés quand même.
+
+Montant d'une ligne = quantité × durée × tarif. Seuls les contrats `paid` et `closed` comptent, rattachés à `start_date`.
+
+## 10. Contenu du dossier
+
+| Fichier ou dossier | Rôle |
+|---|---|
+| `etudiant/schema.sql` | tables, vue `line_amounts`, journal `ingestion_batches` |
+| `etudiant/regles.py`, `etudiant/controle.py` | règles et contrôles de qualité |
+| `etudiant/traitement.py` | signature du lot, chargement en une transaction, rapports, rejeu |
+| `analyses.sql`, `graphique.py` | analyses SQL et graphique |
+| `controle_lot.py`, `generer_tests.py`, `observer_unitaires.py`, `preparer_base_test.py`, `fiche_tests.md` | tests et preuves |
+| `exemples/` | petit échantillon reproductible (2 lots propres de 20 contrats) |
+| `generer.py`, `surveiller.py` | fournis par le kit (non modifiés) |
+| `journal_IA.md` | aides utilisées |
