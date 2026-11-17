@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+flux/
+flux2/
+rapports/
+essais_preuves/
+quarantaine*.jsonl
+essai_mixte/
