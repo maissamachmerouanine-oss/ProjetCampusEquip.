@@ -153,3 +153,11 @@ Montant d'une ligne = quantité × durée × tarif. Seuls les contrats `paid` et
 | `exemples/` | petit échantillon reproductible (2 lots propres de 20 contrats) |
 | `generer.py`, `surveiller.py` | fournis par le kit (non modifiés) |
 | `journal_IA.md` | aides utilisées |
+
+## Bonus réalisés
+
+1. **Index** : `CREATE INDEX idx_contracts_start_date` (fin de `etudiant/schema.sql`). Mesure sur 200 000 contrats : 13,087 ms avant, 1,156 ms après, même résultat (548).
+2. **Catégories récursives** : requête `WITH RECURSIVE` à la fin de `analyses.sql`. Somme des racines = 48 098,00.
+3. **Lecture par morceaux** : `python generer_gros_lot.py --contrats 20000` puis `python lecture_morceaux.py gros_lot --morceaux 8 --contre-exemple`. Décision identique pour les 60 583 lignes.
+
+Preuves et captures : annexes L, M et N du rapport.

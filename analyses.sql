@@ -75,3 +75,28 @@ SELECT l.contract_id, l.line_no, l.quantity, l.unit, l.duration, l.unit_rate,
 FROM contract_lines l
 WHERE l.contract_id = 2
 ORDER BY l.line_no;
+
+-- Bonus 2 : analyse récursive des catégories
+-- Pour chaque catégorie : contrats et montant de la catégorie ET de toutes ses sous-catégories.
+-- Contrôle : la somme des deux racines doit être égale au total paid + closed (48 098,00).
+WITH RECURSIVE fermeture AS (
+    SELECT category_id AS ancetre_id, category_id AS descendant_id FROM categories
+    UNION ALL
+    SELECT f.ancetre_id, c.category_id
+    FROM fermeture f JOIN categories c ON c.parent_id = f.descendant_id
+),
+chemins AS (
+    SELECT category_id, name::text AS chemin, 0 AS niveau FROM categories WHERE parent_id IS NULL
+    UNION ALL
+    SELECT c.category_id, p.chemin || ' > ' || c.name, p.niveau + 1
+    FROM categories c JOIN chemins p ON c.parent_id = p.category_id
+)
+SELECT ch.chemin, ch.niveau,
+       count(DISTINCT la.contract_id) AS contrats,
+       COALESCE(sum(la.amount), 0) AS montant_total
+FROM chemins ch
+JOIN fermeture f ON f.ancetre_id = ch.category_id
+LEFT JOIN equipments e ON e.category_id = f.descendant_id
+LEFT JOIN line_amounts la ON la.equipment_id = e.equipment_id AND la.status IN ('paid','closed')
+GROUP BY ch.chemin, ch.niveau
+ORDER BY ch.chemin;

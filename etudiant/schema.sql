@@ -90,3 +90,5 @@ SELECT s.campus_id,
 FROM contracts c
 JOIN sites s           ON s.site_id = c.site_id
 JOIN contract_lines l  ON l.contract_id = c.contract_id;
+
+CREATE INDEX IF NOT EXISTS idx_contracts_start_date ON contracts (start_date);
